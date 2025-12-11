@@ -31,8 +31,6 @@ setup(
             'task3b_ur5_servo_pick_place = arm.task3b_ur5_servo_pick_place:main',
             'man = arm.task3b_manipulation:main',
             'per = arm.task3b_perception:main',
-
-
             
         ],
     },

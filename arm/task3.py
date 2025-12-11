@@ -3,13 +3,13 @@
 '''
 Team ID:          3577
 Theme:            KRISHI COBOT
-Author List:      Anudeep, Karthik, Vishwa, Manikanta 
+Author List:      Anudeep, Karthik, Vishwa, Manikanta
 Filename:         task3a_tf_publisher.py
-Purpose:          Detect bad fruits and fertilizer can (ArUco) and publish TFs
-                  Naming convention:
-                    <team_id>_bad_fruit_<id>
-                    <team_id>_fertilizer_1
-                  All TFs published w.r.t. 'base_link'.
+Purpose:          Detect ArUco and bad fruits, publish TFs for Task 3A.
+                  - 2 bad fruits: <team_id>_bad_fruit_<id>
+                  - 1 fertilizer can: <team_id>_fertilizer_1
+                  - Drop location on eBot top (ArUco): <team_id>_fertilizer_drop
+                  All TFs are w.r.t. base_link.
 '''
 
 import rclpy
@@ -21,27 +21,17 @@ import numpy as np
 from rclpy.node import Node
 from cv_bridge import CvBridge
 from geometry_msgs.msg import TransformStamped
-from sensor_msgs.msg import Image, CameraInfo
 from scipy.spatial.transform import Rotation as R
+from sensor_msgs.msg import Image
 
-# ---------------- CONFIG / TUNABLES ----------------
-TEAM_ID = "3577"                    # used in TF names
-MAX_BAD_FRUITS = 3                  # publish up to this many bad fruits
-ARUCO_DICT = cv2.aruco.DICT_4X4_50
-ARUCO_SIZE_M = 0.13                 # marker side in meters (adjust if needed)
-ARUCO_MIN_AREA = 800                # minimum pixel area to accept marker
-BAD_FRUIT_MIN_AREA = 200            # min contour area to consider fruit
-TRAY_ROI = (4, 230, 340, 390)       # crop for fruit detection (x1,y1,x2,y2) in pixels
-DEPTH_MIN_M = 0.01                  # ignore very small depths
-FALLBACK_DEPTH_M = 0.55             # fallback if no valid depth found
-# offsets to convert camera coords to base_link — tune to your hardware
-CAM_OFFSET_X = -0.18
-CAM_OFFSET_Y = -0.01999
-CAM_OFFSET_Z = 1.532
-# If you calibrated a secondary offset used for ArUco->base_link, set here:
-ARUCO_CAM_OFFSET_X = -1.101
-ARUCO_CAM_OFFSET_Y = -0.048
-ARUCO_CAM_OFFSET_Z = 0.26
+# ----------------------------- ADDED CONSTANTS -----------------------------
+# ArUco marker ID on top of the eBot that indicates the DROP location
+DROP_MARKER_ID = 6
+
+# Maximum number of bad fruits to publish TF for (Task says 3 bad fruits, we use 2 grey ones)
+MAX_BAD_FRUITS = 2
+# -------------------------------------------------------------------------
+
 
 # ----------------------------- HELPER FUNCTIONS -----------------------------
 
@@ -49,291 +39,419 @@ def calculate_rectangle_area(corners):
     c = np.array(corners)
     width = np.linalg.norm(c[0] - c[1])
     height = np.linalg.norm(c[1] - c[2])
-    return width * height, width
+    area = width * height
+    return area, width
 
-def detect_aruco(image_gray):
-    aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
-    params = cv2.aruco.DetectorParameters()
-    detector = cv2.aruco.ArucoDetector(aruco_dict, params)
-    corners, ids, rejected = detector.detectMarkers(image_gray)
+
+def detect_aruco(image):
+    """
+    Detect ArUco markers and return bounding / pose info.
+    """
+    # lowered threshold so markers slightly far still detected
+    aruco_area_threshold = 800
+
+    cam_mat = np.array([[915.3, 0.0, 642.7],
+                        [0.0, 914.03, 361.97],
+                        [0.0, 0.0, 1.0]], dtype=np.float64)
+    dist_mat = np.zeros(5, dtype=np.float64)
+    size_of_aruco_m = 0.13  # meters (marker side)
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    aruco_params = cv2.aruco.DetectorParameters()
+    detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
+
+    corners, ids, _ = detector.detectMarkers(gray)
+    center_aruco_list, distance_from_rgb_list, angle_aruco_list, width_aruco_list, valid_ids = [], [], [], [], []
+    rvecs_out, tvecs_out = None, None
+
     if ids is None or len(ids) == 0:
-        return [], [], None
-    ids = ids.flatten()
-    return corners, ids, detector
+        return center_aruco_list, distance_from_rgb_list, angle_aruco_list, width_aruco_list, valid_ids, None, None
 
-def detect_bad_fruits(image_bgr):
-    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    # HSV range tuned for pale/bad fruit (adjust if needed)
-    lower_bad = np.array([0, 0, 100])
-    upper_bad = np.array([179, 60, 255])
-    mask = cv2.inRange(hsv, lower_bad, upper_bad)
+    try:
+        rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
+            corners, size_of_aruco_m, cam_mat, dist_mat)
+        rvecs_out, tvecs_out = rvecs, tvecs
+    except Exception as e:
+        print(f"estimatePoseSingleMarkers exception: {e}")
+
+    ids = ids.flatten()
+    cv2.aruco.drawDetectedMarkers(image, corners, ids)
+
+    for idx, corner in enumerate(corners):
+        pts = corner[0].astype(np.float32)
+        area, width = calculate_rectangle_area(pts)
+        if area < aruco_area_threshold:
+            continue
+
+        cX, cY = int(np.mean(pts[:, 0])), int(np.mean(pts[:, 1]))
+        yaw, marker_dist = 1.0, None
+
+        if rvecs_out is not None and tvecs_out is not None and idx < len(tvecs_out):
+            rvec = rvecs_out[idx].reshape(3)
+            tvec = tvecs_out[idx].reshape(3)
+            if np.isfinite(rvec).all() and np.isfinite(tvec).all() and tvec[2] > 0:
+                try:
+                    cv2.drawFrameAxes(image, cam_mat, dist_mat, rvec, tvec, size_of_aruco_m * 0.5)
+                except cv2.error:
+                    pass
+                rmat = cv2.Rodrigues(rvec)[0]
+                yaw = math.atan2(rmat[1, 0], rmat[0, 0])
+                marker_dist = float(tvec[2])
+
+        center_aruco_list.append((cX, cY))
+        distance_from_rgb_list.append(marker_dist)
+        angle_aruco_list.append(yaw)
+        width_aruco_list.append(width)
+        valid_ids.append(int(ids[idx]))
+        cv2.circle(image, (cX, cY), 6, (0, 255, 0), -1)
+
+    return (center_aruco_list, distance_from_rgb_list,
+            angle_aruco_list, width_aruco_list, valid_ids, rvecs_out, tvecs_out)
+
+
+def detect_bad_fruits(image):
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+    # -------- GREY BAD FRUITS ONLY --------
+    # Grey = low saturation (almost no colour), can be dark or a bit brighter.
+    # Purple fruit has high saturation and H around 130–160, so we keep:
+    #   - H in [0, 40]  -> brown/grey region only
+    #   - S in [0, 55]  -> kills purple
+    #   - V in [20, 190] -> allows both dark and light grey bodies
+    lower_grey_dark  = np.array([0,  0,  20], dtype=np.uint8)
+    upper_grey_dark  = np.array([40, 55, 120], dtype=np.uint8)
+
+    lower_grey_light = np.array([0,  0,  80], dtype=np.uint8)
+    upper_grey_light = np.array([40, 55, 190], dtype=np.uint8)
+
+    mask_dark  = cv2.inRange(hsv, lower_grey_dark,  upper_grey_dark)
+    mask_light = cv2.inRange(hsv, lower_grey_light, upper_grey_light)
+
+    # combine both ranges to cover both grey fruits
+    mask = cv2.bitwise_or(mask_dark, mask_light)
+
+    # clean up noise & fill small holes so contours are solid
     kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    x1, y1, x2, y2 = TRAY_ROI
+    # ---------------------- TRAY REGION ----------------------
+    tray_x1, tray_y1, tray_x2, tray_y2 = 108, 445, 355, 591
+
     filtered = []
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
-        if x >= x1 and y >= y1 and (x + w) <= x2 and (y + h) <= y2:
-            if cv2.contourArea(cnt) > BAD_FRUIT_MIN_AREA:
-                filtered.append((x, y, w, h, cnt))
-    # sort by area descending (largest first) to have deterministic indexing
-    filtered.sort(key=lambda t: cv2.contourArea(t[4]), reverse=True)
-    return filtered[:MAX_BAD_FRUITS]
 
-def depth_value_from_pixel(depth_img, px, py):
-    # depth_img could be 16UC1 (millimeters) or 32FC1 (meters).
-    try:
-        raw = depth_img[int(py), int(px)]
-    except Exception:
-        return None
-    if raw is None:
-        return None
-    # If dtype is uint16, typical scale is mm -> convert to meters
-    if np.issubdtype(depth_img.dtype, np.integer):
-        raw = float(raw)
-        if raw <= 10.0:
-            # often zero or invalid
-            return None
-        return raw / 1000.0
-    else:
-        # float32
-        raw = float(raw)
-        if not np.isfinite(raw) or raw <= 0.0:
-            return None
-        return raw
+        if x >= tray_x1 and y >= tray_y1 and (x + w) <= tray_x2 and (y + h) <= tray_y2:
+            # slightly lower area so weaker bad_fruit_2 still passes
+            if cv2.contourArea(cnt) > 70:
+                filtered.append(cnt)
 
-# ----------------------------- ROS2 NODE -----------------------------
+    return filtered
 
-class TaskTFPublisher(Node):
+
+def refine_with_green_top(hsv, x, y, w, h):
+    """
+    From a grey fruit body bbox (x,y,w,h), search above it for the green top.
+    Returns:
+        x_full, y_full, w_full, h_full, cx_top, cy_top
+    full bbox ~= full fruit (grey body + green top), a bit extended.
+    cx_top, cy_top = centroid of green top
+    If no green is found, fall back to body bbox and body top-centre.
+    """
+    img_h, img_w = hsv.shape[:2]
+
+    # region of interest: above + including the grey body
+    SEARCH_UP_FACTOR = 0.9
+    roi_top_y    = max(0, int(y - SEARCH_UP_FACTOR * h))
+    roi_bottom_y = min(img_h, y + h)
+    roi_left_x   = max(0, x)
+    roi_right_x  = min(img_w, x + w)
+
+    roi_hsv = hsv[roi_top_y:roi_bottom_y, roi_left_x:roi_right_x]
+
+    # green top HSV (from RGB ~110,168,113)
+    lower_green = np.array([45, 40, 60], dtype=np.uint8)
+    upper_green = np.array([85, 200, 200], dtype=np.uint8)
+
+    mask = cv2.inRange(roi_hsv, lower_green, upper_green)
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if len(contours) == 0:
+        # fallback: body bbox & its top-centre
+        cx_top = x + w // 2
+        cy_top = y
+        return x, y, w, h, cx_top, cy_top
+
+    # pick largest green blob as the top
+    top_cnt = max(contours, key=cv2.contourArea)
+    gx, gy, gw, gh = cv2.boundingRect(top_cnt)
+
+    gx_global = roi_left_x + gx
+    gy_global = roi_top_y + gy
+
+    # base union of body and top
+    x_full  = min(x, gx_global)
+    y_full  = min(y, gy_global)
+    x_full2 = max(x + w, gx_global + gw)
+    y_full2 = max(y + h, gy_global + gh)
+    w_full  = x_full2 - x_full
+    h_full  = y_full2 - y_full
+
+    # ---------- EXTEND BBOX TO COVER FULL FRUIT ----------
+    # extend a bit above the union and more below it
+    margin_top = int(0.5 * h_full)     # 20% extra above
+    margin_bot = int(0.2 * h_full)     # 40% extra below
+
+    new_y = max(0, y_full - margin_top)
+    new_bottom = min(img_h, y_full + h_full + margin_bot)
+    new_h = new_bottom - new_y
+
+    y_full = new_y
+    h_full = new_h
+
+    # centroid of green top (used for TF & green dot)
+    cx_top = gx_global + gw // 2
+    cy_top = gy_global + gh // 2
+
+    return x_full, y_full, w_full, h_full, cx_top, cy_top
+
+
+
+# ----------------------------- MAIN CLASS ----------------------------------
+
+class aruco_tf(Node):
     def __init__(self):
-        super().__init__('task3a_tf_publisher')
-        # Subscribe to the exact topics required
-        self.color_sub = self.create_subscription(
-            Image, '/camera/camera/color/image_raw', self.color_cb, 10)
-        self.depth_sub = self.create_subscription(
-            Image, '/camera/camera/aligned_depth_to_color/image_raw', self.depth_cb, 10)
-        self.caminfo_sub = self.create_subscription(
-            CameraInfo, '/camera/camera/color/camera_info', self.caminfo_cb, 10)
+        super().__init__('aruco_tf_publisher')
+
+        # Color & depth topics from remote hardware
+        self.color_cam_sub = self.create_subscription(
+            Image, '/camera/camera/color/image_raw', self.colorimagecb, 10)
+        self.depth_cam_sub = self.create_subscription(
+            Image, '/camera/camera/aligned_depth_to_color/image_raw', self.depthimagecb, 10)
 
         self.bridge = CvBridge()
-        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
-        self.timer = self.create_timer(0.12, self.timer_cb)
-
+        self.br = tf2_ros.TransformBroadcaster(self)
+        self.timer = self.create_timer(0.12, self.process_image)
         self.cv_image = None
         self.depth_image = None
-        self.cam_intrinsics = None  # will be a dict with fx, fy, cx, cy, cam_mat
+        self.team_id = 3577  # used in TF names
 
-        # default intrinsics (fallback)
-        self.default_intr = {
-            'fx': 931.1829833984375,
-            'fy': 931.1829833984375,
-            'cx': 640.0,
-            'cy': 360.0,
-            'cam_mat': np.array([[915.3, 0.0, 642.7],
-                                 [0.0, 914.03, 361.97],
-                                 [0.0, 0.0, 1.0]], dtype=np.float64)
-        }
-
-        self.get_logger().info("TaskTFPublisher initialized. Waiting for images...")
-
-    def caminfo_cb(self, msg: CameraInfo):
+    def depthimagecb(self, data):
         try:
-            K = np.array(msg.k).reshape((3, 3))
-            fx = K[0, 0]
-            fy = K[1, 1]
-            cx = K[0, 2]
-            cy = K[1, 2]
-            self.cam_intrinsics = {'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy, 'cam_mat': K}
+            self.depth_image = self.bridge.imgmsg_to_cv2(data, desired_encoding='passthrough')
         except Exception as e:
-            self.get_logger().warn(f"Failed to parse CameraInfo: {e}")
+            self.get_logger().error(f"Depth image conversion failed: {str(e)}")
 
-    def depth_cb(self, msg: Image):
+    def colorimagecb(self, data):
         try:
-            # keep raw encoding to decide conversion later
-            self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+            self.cv_image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
         except Exception as e:
-            self.get_logger().error(f"Depth image conversion failed: {e}")
-            self.depth_image = None
+            self.get_logger().error(f"Color image conversion failed: {str(e)}")
 
-    def color_cb(self, msg: Image):
-        try:
-            self.cv_image = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-        except Exception as e:
-            self.get_logger().error(f"Color image conversion failed: {e}")
-            self.cv_image = None
-
-    def timer_cb(self):
+    def process_image(self):
         if self.cv_image is None:
             return
 
-        intr = self.cam_intrinsics if self.cam_intrinsics is not None else self.default_intr
-        fx = intr['fx']
-        fy = intr['fy']
-        cx = intr['cx']
-        cy = intr['cy']
-        cam_mat = intr['cam_mat']
+        # Camera intrinsics / image center
+        centerCamX, centerCamY = 640.0, 360.0
+        focalX, focalY = 931.1829833984375, 931.1829833984375
+
+        # Offsets (tune these to your Gazebo/real camera mount)
+        CAMERA_OFFSET_X = 0.11
+        CAMERA_OFFSET_Y = -0.01999
+        CAMERA_OFFSET_Z = 1.452
+        # secondary camera/base offsets used for ArUco pose -> base_link conversion
+        CAMERAA_OFFSET_X = -1.118
+        CAMERAA_OFFSET_Y = -0.08
+        CAMERAA_OFFSET_Z = 0.26
 
         img = self.cv_image.copy()
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-        # ---- ArUco detection (for fertilizer can) ----
-        corners, ids, detector = detect_aruco(gray)
-        fertilizer_published = False
-        if ids is not None and len(ids) > 0 and detector is not None:
-            # compute poses if possible
-            try:
-                rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-                    corners, ARUCO_SIZE_M, cam_mat, np.zeros(5))
-            except Exception:
-                rvecs, tvecs = None, None
+        c_list, d_list, a_list, w_list, ids, rvecs, tvecs = detect_aruco(img)
+        bad_fruit_contours = detect_bad_fruits(img)
 
-            for idx, marker_id in enumerate(ids):
-                pts = corners[idx][0].astype(np.float32)
-                area, _ = calculate_rectangle_area(pts)
-                if area < ARUCO_MIN_AREA:
-                    continue
-                # If we have pose estimate, use it to compute TF for fertilizer
-                if tvecs is not None and idx < len(tvecs):
-                    tvec = tvecs[idx].reshape(3)
-                    if not np.isfinite(tvec).all() or tvec[2] <= 0.0:
-                        continue
-
-                    # Convert OpenCV marker pose into base_link coordinates
-                    X_cam_cv, Y_cam_cv, Z_cam_cv = float(tvec[0]), float(tvec[1]), float(tvec[2])
-
-                    # Apply empirical conversion (tune if needed)
-                    base_x = ARUCO_CAM_OFFSET_X + (Z_cam_cv * math.cos(math.radians(8))) + (Y_cam_cv * math.sin(math.radians(8)))
-                    base_y = -(ARUCO_CAM_OFFSET_Y + X_cam_cv)
-                    base_z = ARUCO_CAM_OFFSET_Z - (Y_cam_cv * math.cos(math.radians(8))) + (Z_cam_cv * math.sin(math.radians(8)))
-
-                    # Build rotation: convert rvec -> rotation matrix (OpenCV), then to ROS frame
-                    try:
-                        rvec = rvecs[idx].reshape(3)
-                        rmat_cv, _ = cv2.Rodrigues(rvec)  # OpenCV camera frame
-                        # OpenCV camera frame: X-right, Y-down, Z-forward
-                        # Convert to ROS camera frame: X-right, Y-forward, Z-up
-                        cv_to_ros = np.array([[1, 0, 0],
-                                              [0, 0, 1],
-                                              [0, -1, 0]])
-                        rmat_ros = cv_to_ros @ rmat_cv
-
-                        # Optionally rotate marker frame to standard orientation (so fertilizer frame is stable)
-                        # rotate about X to make Z upwards if needed
-                        rot_x = R.from_euler('x', 140, degrees=True).as_matrix()
-                        rmat_final = rmat_ros @ rot_x
-
-                        quat = R.from_matrix(rmat_final).as_quat()
-                    except Exception:
-                        quat = R.from_euler('xyz', [0, 0, 0]).as_quat()
-
-                    # Publish fertilizer TF with required naming convention
-                    t_fert = TransformStamped()
-                    t_fert.header.stamp = self.get_clock().now().to_msg()
-                    t_fert.header.frame_id = 'base_link'
-                    t_fert.child_frame_id = f"{TEAM_ID}_fertilizer_1"
-                    t_fert.transform.translation.x = float(base_x)
-                    t_fert.transform.translation.y = float(base_y)
-                    t_fert.transform.translation.z = float(base_z)
-                    t_fert.transform.rotation.x = float(quat[0])
-                    t_fert.transform.rotation.y = float(quat[1])
-                    t_fert.transform.rotation.z = float(quat[2])
-                    t_fert.transform.rotation.w = float(quat[3])
-                    self.tf_broadcaster.sendTransform(t_fert)
-                    fertilizer_published = True
-
-                    # draw
-                    cv2.drawFrameAxes(img, cam_mat, np.zeros(5), rvec, tvec, ARUCO_SIZE_M * 0.5)
-                    cv2.putText(img, f"FERT_{marker_id}", (int(np.mean(pts[:, 0])), int(np.mean(pts[:, 1])) - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-                    break  # only publish one fertilizer TF (first valid)
-        # If no aruco found, fertilizer remains unpublished (robot will get no TF)
-
-        # ---- Bad fruit detection and TF publishing ----
-        bads = detect_bad_fruits(img)
+        # ---------------------- Bad fruits TF ----------------------
         depth_values = []
-        # collect candidate depths from each detection center for averaging
-        for (x, y, w, h, cnt) in bads:
-            cx = x + w // 2
-            cy = y + h // 2
+        for cnt in bad_fruit_contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            cx_mid, cy_mid = x + w // 2, y + h // 2
             if self.depth_image is not None:
-                d = depth_value_from_pixel(self.depth_image, cx, cy)
-                if d is not None and d > DEPTH_MIN_M and np.isfinite(d):
-                    depth_values.append(d)
+                try:
+                    raw = float(self.depth_image[int(cy_mid), int(cx_mid)])
+                    depth_val = raw / 1000.0 if raw > 10.0 else raw
+                    if np.isfinite(depth_val) and depth_val > 0.01:
+                        depth_values.append(depth_val)
+                except Exception:
+                    pass
 
-        common_depth = float(np.mean(depth_values)) if len(depth_values) > 0 else FALLBACK_DEPTH_M
+        common_depth = float(np.mean(depth_values)) if len(depth_values) > 0 else 0.55
 
-        fruit_id = 1
-        for (x, y, w, h, cnt) in bads:
-            cx = x + w // 2
-            cy = y + int(0.2 * h)  # slightly above center
-            depth_val = common_depth
-            # if possible, override with per-pixel depth
-            if self.depth_image is not None:
-                d_local = depth_value_from_pixel(self.depth_image, cx, cy)
-                if d_local is not None and np.isfinite(d_local) and d_local > DEPTH_MIN_M:
-                    depth_val = d_local
+        bad_fruit_id = 1
+        for cnt in bad_fruit_contours:
+            # LIMIT to MAX_BAD_FRUITS
+            if bad_fruit_id > MAX_BAD_FRUITS:
+                break
 
-            # Project pixel -> camera coordinates (OpenCV camera frame)
-            X_cam = (float(cx) - cx) * depth_val / fx   # bug: corrected below
-            # above line erroneously uses local cx variable; fix actual formulas below
+            x_body, y_body, w_body, h_body = cv2.boundingRect(cnt)
 
-            X_cam = (float(cx) - intr['cx']) * depth_val / fx
-            Y_cam = -(float(cy) - intr['cy']) * depth_val / fy
-            Z_cam = depth_val
+            # extend to full fruit using green top, get top-centre
+            x_full, y_full, w_full, h_full, cx_top, cy_top = refine_with_green_top(
+                hsv, x_body, y_body, w_body, h_body
+            )
 
-            # Convert camera coords to base_link coords (empirical offsets)
-            base_x = CAM_OFFSET_X + Y_cam
-            base_y = -(CAM_OFFSET_Y + X_cam)
-            base_z = CAM_OFFSET_Z - Z_cam
+            depth_value = common_depth
+
+            # back-project using top-centre pixel
+            X_cam = (float(cx_top) - centerCamX) * depth_value / focalX
+            Y_cam = -(float(cy_top) - centerCamY) * depth_value / focalY
+            Z_cam = depth_value
+
+            base_x = CAMERA_OFFSET_X + Y_cam
+            base_y = -(CAMERA_OFFSET_Y + X_cam)
+            base_z = CAMERA_OFFSET_Z - Z_cam
 
             t_bad = TransformStamped()
             t_bad.header.stamp = self.get_clock().now().to_msg()
             t_bad.header.frame_id = 'base_link'
-            t_bad.child_frame_id = f"{TEAM_ID}_bad_fruit_{fruit_id}"
+            t_bad.child_frame_id = f"{self.team_id}_bad_fruit_{bad_fruit_id}"
             t_bad.transform.translation.x = float(base_x)
             t_bad.transform.translation.y = float(base_y)
             t_bad.transform.translation.z = float(base_z)
 
-            # orientation: make frame point upwards (quat for 180 deg about X to align)
             quat_down = R.from_euler('xyz', [math.pi, 0.0, 0.0]).as_quat()
-            t_bad.transform.rotation.x = float(quat_down[0])
-            t_bad.transform.rotation.y = float(quat_down[1])
-            t_bad.transform.rotation.z = float(quat_down[2])
-            t_bad.transform.rotation.w = float(quat_down[3])
+            t_bad.transform.rotation.x = quat_down[0]
+            t_bad.transform.rotation.y = quat_down[1]
+            t_bad.transform.rotation.z = quat_down[2]
+            t_bad.transform.rotation.w = quat_down[3]
+            self.br.sendTransform(t_bad)
 
-            self.tf_broadcaster.sendTransform(t_bad)
+            # draw full fruit bbox and top-centre dot
+            cv2.rectangle(img, (x_full, y_full),
+                          (x_full + w_full, y_full + h_full),
+                          (0, 255, 0), 2)
+            cv2.circle(img, (cx_top, cy_top), 6, (0, 255, 0), -1)
+            cv2.putText(img, f"bad_fruit_{bad_fruit_id}", (x_full, y_full - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            # draw visuals
-            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.circle(img, (cx, cy), 4, (0, 255, 0), -1)
-            cv2.putText(img, f"{TEAM_ID}_bad_fruit_{fruit_id}", (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            fruit_id += 1
+            bad_fruit_id += 1
 
-        # Optionally show the image - comment out if running headless on remote server
-        try:
-            cv2.imshow("Detection - Bad Fruits & Fertilizer", img)
-            cv2.waitKey(1)
-        except Exception:
-            # headless environment may raise
-            pass
+        # ---------------------- ArUco TFs (corrected orientation) ----------------------
+        if ids is not None and len(ids) > 0 and tvecs is not None:
+            for idx, marker_id in enumerate(ids):
+                if idx >= len(tvecs):
+                    continue
+                tvec = tvecs[idx].reshape(3)
+                # skip invalid pose
+                if not np.isfinite(tvec).all() or tvec[2] <= 0.0:
+                    continue
 
-def main(args=None):
-    rclpy.init(args=args)
-    node = TaskTFPublisher()
+                # Camera-space marker coordinates (OpenCV convention)
+                X_cam, Y_cam, Z_cam = float(tvec[0]), float(tvec[1]), float(tvec[2])
+
+                # Convert marker camera coordinates to base_link coordinates
+                base_x = CAMERAA_OFFSET_X + (Z_cam * math.cos(math.radians(8))) + (Y_cam * math.sin(math.radians(8)))
+                base_y = -(CAMERAA_OFFSET_Y + X_cam)
+                base_z = CAMERAA_OFFSET_Z - (Y_cam * math.cos(math.radians(8))) + (Z_cam * math.sin(math.radians(8)))
+
+                # marker-specific small tweaks
+                if marker_id == 6:
+                    base_z += -0.87
+                    base_y += -0.0
+                    base_x += -0.06
+
+                # Build a robust orientation quaternion for the marker frame
+                try:
+                    rvec = rvecs[idx].reshape(3)
+                    rmat_cv, _ = cv2.Rodrigues(rvec)  # rotation matrix: OpenCV camera frame
+
+                    # Convert OpenCV -> ROS camera frame
+                    cv_to_ros = np.array([
+                        [1, 0, 0],
+                        [0, 0, 1],
+                        [0,-1, 0]
+                    ])
+
+                    # Side-pick extra rotation for specific marker (e.g. marker_id == 3)
+                    side_pick_rotation = R.from_euler('xyz', [110, 90, 150], degrees=True).as_matrix()
+
+                    # Compose final rotation matrix:
+                    rmat_ros = cv_to_ros @ rmat_cv
+
+                    if marker_id == 3:
+                        rmat_final = rmat_ros @ side_pick_rotation
+                    else:
+                        # for other markers keep top-down-ish orientation
+                        rot_x_140 = R.from_euler('x', 140, degrees=True).as_matrix()
+                        rmat_final = rmat_ros @ rot_x_140
+
+                    quat_marker = R.from_matrix(rmat_final).as_quat()
+
+                except Exception as e:
+                    self.get_logger().warn(f"ArUco orientation conversion failed for id {marker_id}: {e}")
+                    # fallback to default quaternion
+                    quat_marker = R.from_euler('xyz', [0, 0, 0]).as_quat()
+
+                # Fertilizer can TF
+                t_obj = TransformStamped()
+                t_obj.header.stamp = self.get_clock().now().to_msg()
+                t_obj.header.frame_id = 'base_link'
+                t_obj.child_frame_id = f"{self.team_id}_fertilizer_1"
+                t_obj.transform.translation.x = float(base_x)
+                t_obj.transform.translation.y = float(base_y)
+                t_obj.transform.translation.z = float(base_z)
+                t_obj.transform.rotation.x = float(quat_marker[0])
+                t_obj.transform.rotation.y = float(quat_marker[1])
+                t_obj.transform.rotation.z = float(quat_marker[2])
+                t_obj.transform.rotation.w = float(quat_marker[3])
+
+                self.br.sendTransform(t_obj)
+
+                # DROP LOCATION TF if this is the drop marker
+                try:
+                    if int(marker_id) == DROP_MARKER_ID:
+                        t_drop = TransformStamped()
+                        t_drop.header.stamp = t_obj.header.stamp
+                        t_drop.header.frame_id = t_obj.header.frame_id   # 'base_link'
+                        t_drop.child_frame_id = f"{self.team_id}_fertilizer_drop"
+
+                        t_drop.transform.translation.x = float(base_x)
+                        t_drop.transform.translation.y = float(base_y)
+                        t_drop.transform.translation.z = float(base_z)
+
+                        t_drop.transform.rotation.x = float(quat_marker[0])
+                        t_drop.transform.rotation.y = float(quat_marker[1])
+                        t_drop.transform.rotation.z = float(quat_marker[2])
+                        t_drop.transform.rotation.w = float(quat_marker[3])
+
+                        self.br.sendTransform(t_drop)
+                except Exception as e:
+                    self.get_logger().warn(f"Drop TF publish failed for marker {marker_id}: {e}")
+                # --------------------------------------------------------------------
+
+        cv2.imshow("Bad Fruit Contours + ArUco Detection", img)
+        cv2.waitKey(1)
+
+
+def main():
+    rclpy.init(args=sys.argv)
+    node = aruco_tf()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        try:
-            cv2.destroyAllWindows()
-        except Exception:
-            pass
         node.destroy_node()
         rclpy.shutdown()
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
