@@ -3,13 +3,14 @@
 '''
 Team ID:          3577
 Theme:            KRISHI COBOT
-Author List:      Anudeep, Karthik, Vishwa, Manikanta
+Author List:      D Anudeep, Karthik, Vishwa, Manikanta
 Filename:         task3a_tf_publisher.py
 Purpose:          Detect ArUco and bad fruits, publish TFs for Task 3A.
                   - 2 bad fruits: <team_id>_bad_fruit_<id>
                   - 1 fertilizer can: <team_id>_fertilizer_1
                   - Drop location on eBot top (ArUco): <team_id>_fertilizer_drop
                   All TFs are w.r.t. base_link.
+Improved: rejects colourful (purple) good fruit using Lab-chroma test.
 '''
 
 import rclpy
@@ -30,6 +31,12 @@ DROP_MARKER_ID = 6
 
 # Maximum number of bad fruits to publish TF for (Task says 3 bad fruits, we use 2 grey ones)
 MAX_BAD_FRUITS = 2
+
+# Chromaticity threshold (CIELab chroma). Anything above this is considered "colourful" -> REJECT.
+CHROMA_THRESH = 18.0
+
+# Tray bbox (tune if needed)
+TRAY_X1, TRAY_Y1, TRAY_X2, TRAY_Y2 = 108, 445, 355, 591
 # -------------------------------------------------------------------------
 
 
@@ -110,45 +117,148 @@ def detect_aruco(image):
             angle_aruco_list, width_aruco_list, valid_ids, rvecs_out, tvecs_out)
 
 
+# ------------------ Improved bad fruit detection (reject colourful fruit) ------------------
+
+def median_depth_in_bbox(depth_img, x, y, w, h):
+    """Return median depth (meters) in bbox or None if invalid."""
+    if depth_img is None:
+        return None
+    h_img, w_img = depth_img.shape[:2]
+    x1 = max(0, int(x))
+    y1 = max(0, int(y))
+    x2 = min(w_img, int(x + w))
+    y2 = min(h_img, int(y + h))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    roi = depth_img[y1:y2, x1:x2].astype(np.float32).flatten()
+    roi = roi[np.isfinite(roi)]
+    roi = roi[roi > 0]
+    if roi.size == 0:
+        return None
+    med = float(np.median(roi))
+    # convert mm->m heuristic if needed
+    if med > 10.0:
+        med = med / 1000.0
+    if med < 0.01:
+        return None
+    return med
+
+
 def detect_bad_fruits(image):
+    """
+    Improved detection:
+     - Primary: detect green tops using HSV + HoughCircles
+     - Expand each top to a body bbox
+     - Fallback: grey-body contour detection (as original)
+     - Reject any candidate whose Lab chroma > CHROMA_THRESH
+    Returns: list of contours (rect-like arrays or real contours)
+    """
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    img_h, img_w = image.shape[:2]
 
-    # -------- GREY BAD FRUITS ONLY --------
-    # Grey = low saturation (almost no colour), can be dark or a bit brighter.
-    # Purple fruit has high saturation and H around 130–160, so we keep:
-    #   - H in [0, 40]  -> brown/grey region only
-    #   - S in [0, 55]  -> kills purple
-    #   - V in [20, 190] -> allows both dark and light grey bodies
-    lower_grey_dark  = np.array([0,  0,  20], dtype=np.uint8)
-    upper_grey_dark  = np.array([40, 55, 120], dtype=np.uint8)
+    # ---- 1) Green top mask (broader range) ----
+    lower_green = np.array([40, 30, 50], dtype=np.uint8)
+    upper_green = np.array([90, 255, 255], dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower_green, upper_green)
 
-    lower_grey_light = np.array([0,  0,  80], dtype=np.uint8)
-    upper_grey_light = np.array([40, 55, 190], dtype=np.uint8)
-
-    mask_dark  = cv2.inRange(hsv, lower_grey_dark,  upper_grey_dark)
-    mask_light = cv2.inRange(hsv, lower_grey_light, upper_grey_light)
-
-    # combine both ranges to cover both grey fruits
-    mask = cv2.bitwise_or(mask_dark, mask_light)
-
-    # clean up noise & fill small holes so contours are solid
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    # morphological cleanup
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # ---- 2) Hough circle on blurred mask to find circular tops ----
+    mask_blur = cv2.GaussianBlur(mask, (7, 7), 0)
+    circles = None
+    try:
+        circles = cv2.HoughCircles(mask_blur, cv2.HOUGH_GRADIENT, dp=1.2, minDist=30,
+                                   param1=50, param2=12, minRadius=6, maxRadius=60)
+    except Exception:
+        circles = None
 
-    # ---------------------- TRAY REGION ----------------------
-    tray_x1, tray_y1, tray_x2, tray_y2 = 108, 445, 355, 591
+    detected_contours = []
 
-    filtered = []
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
+    if circles is not None:
+        circles = np.round(circles[0, :]).astype(int)
+        for (cx, cy, r) in circles:
+            x_full = max(0, cx - int(1.2 * r))
+            y_full = max(0, cy - int(0.8 * r))
+            w_full = min(img_w - x_full, int(2.4 * r))
+            h_full = min(img_h - y_full, int(2.6 * r))
+            rect = np.array([[[x_full, y_full]], [[x_full + w_full, y_full]],
+                             [[x_full + w_full, y_full + h_full]], [[x_full, y_full + h_full]]])
+            detected_contours.append(rect)
 
-        if x >= tray_x1 and y >= tray_y1 and (x + w) <= tray_x2 and (y + h) <= tray_y2:
-            # slightly lower area so weaker bad_fruit_2 still passes
+    # If Hough didn't find anything, try to find connected green blobs
+    if len(detected_contours) == 0:
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            if cv2.contourArea(cnt) < 40:
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            x_full = max(0, x - int(w * 0.5))
+            w_full = min(img_w - x_full, int(w * 2.0))
+            y_full = max(0, y - int(h * 0.2))
+            h_full = min(img_h - y_full, int(h * 2.0))
+            rect = np.array([[[x_full, y_full]], [[x_full + w_full, y_full]],
+                             [[x_full + w_full, y_full + h_full]], [[x_full, y_full + h_full]]])
+            detected_contours.append(rect)
+
+    # Fallback: grey-body detection (if no green top found)
+    if len(detected_contours) == 0:
+        lower_grey_dark = np.array([0, 0, 18], dtype=np.uint8)
+        upper_grey_dark = np.array([45, 65, 130], dtype=np.uint8)
+        lower_grey_light = np.array([0, 0, 70], dtype=np.uint8)
+        upper_grey_light = np.array([45, 70, 210], dtype=np.uint8)
+
+        mask_dark = cv2.inRange(hsv, lower_grey_dark, upper_grey_dark)
+        mask_light = cv2.inRange(hsv, lower_grey_light, upper_grey_light)
+        mask_grey = cv2.bitwise_or(mask_dark, mask_light)
+
+        kernel2 = np.ones((5, 5), np.uint8)
+        mask_grey = cv2.morphologyEx(mask_grey, cv2.MORPH_OPEN, kernel2)
+        mask_grey = cv2.morphologyEx(mask_grey, cv2.MORPH_CLOSE, kernel2, iterations=2)
+
+        contours, _ = cv2.findContours(mask_grey, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
             if cv2.contourArea(cnt) > 70:
-                filtered.append(cnt)
+                detected_contours.append(cnt)
+
+    # Final filter: tray overlap + Lab-chroma rejection
+    filtered = []
+    for rect in detected_contours:
+        x, y, w, h = cv2.boundingRect(rect)
+        if w <= 2 or h <= 2:
+            continue
+
+        # tray overlap check (allow partial overlap)
+        inter_x1 = max(x, TRAY_X1); inter_y1 = max(y, TRAY_Y1)
+        inter_x2 = min(x + w, TRAY_X2); inter_y2 = min(y + h, TRAY_Y2)
+        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+        rect_area = float(max(1, w * h))
+        if inter_area < 0.2 * rect_area:
+            continue
+
+        # compute Lab chroma inside this bbox
+        x0 = max(0, int(x)); y0 = max(0, int(y))
+        x1 = min(img_w, int(x + w)); y1 = min(img_h, int(y + h))
+        patch = lab[y0:y1, x0:x1]
+        if patch.size == 0:
+            continue
+        a = patch[:, :, 1].astype(np.float32) - 128.0
+        b = patch[:, :, 2].astype(np.float32) - 128.0
+        chroma = np.sqrt(a * a + b * b)
+        mean_chroma = float(np.nanmean(chroma))
+        # Reject colourful patches (purple good fruit)
+        if mean_chroma > CHROMA_THRESH:
+            # skip - likely colored fruit (good)
+            continue
+
+        # area threshold safe-check
+        if cv2.contourArea(rect) < 50:
+            continue
+
+        filtered.append(rect)
 
     return filtered
 
@@ -158,71 +268,83 @@ def refine_with_green_top(hsv, x, y, w, h):
     From a grey fruit body bbox (x,y,w,h), search above it for the green top.
     Returns:
         x_full, y_full, w_full, h_full, cx_top, cy_top
-    full bbox ~= full fruit (grey body + green top), a bit extended.
-    cx_top, cy_top = centroid of green top
-    If no green is found, fall back to body bbox and body top-centre.
+    If no green found, fall back to body bbox and body top-centre.
     """
     img_h, img_w = hsv.shape[:2]
 
-    # region of interest: above + including the grey body
     SEARCH_UP_FACTOR = 0.9
-    roi_top_y    = max(0, int(y - SEARCH_UP_FACTOR * h))
+    roi_top_y = max(0, int(y - SEARCH_UP_FACTOR * h))
     roi_bottom_y = min(img_h, y + h)
-    roi_left_x   = max(0, x)
-    roi_right_x  = min(img_w, x + w)
+    roi_left_x = max(0, x - int(0.25 * w))
+    roi_right_x = min(img_w, x + w + int(0.25 * w))
 
     roi_hsv = hsv[roi_top_y:roi_bottom_y, roi_left_x:roi_right_x]
-
-    # green top HSV (from RGB ~110,168,113)
-    lower_green = np.array([45, 40, 60], dtype=np.uint8)
-    upper_green = np.array([85, 200, 200], dtype=np.uint8)
-
-    mask = cv2.inRange(roi_hsv, lower_green, upper_green)
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if len(contours) == 0:
-        # fallback: body bbox & its top-centre
+    if roi_hsv.size == 0:
         cx_top = x + w // 2
         cy_top = y
         return x, y, w, h, cx_top, cy_top
 
-    # pick largest green blob as the top
-    top_cnt = max(contours, key=cv2.contourArea)
-    gx, gy, gw, gh = cv2.boundingRect(top_cnt)
+    lower_green = np.array([40, 35, 55], dtype=np.uint8)
+    upper_green = np.array([90, 255, 255], dtype=np.uint8)
+    mask = cv2.inRange(roi_hsv, lower_green, upper_green)
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    gx_global = roi_left_x + gx
-    gy_global = roi_top_y + gy
+    # Hough circles
+    top_centroid = None
+    try:
+        mask_blur = cv2.GaussianBlur(mask, (7, 7), 0)
+        circles = cv2.HoughCircles(mask_blur, cv2.HOUGH_GRADIENT, dp=1.2, minDist=10,
+                                   param1=40, param2=10, minRadius=4, maxRadius=40)
+        if circles is not None:
+            circles = np.uint16(np.around(circles))[0, :]
+            circles = sorted(circles, key=lambda c: c[2], reverse=True)
+            gx, gy, _ = circles[0]
+            gx_global = roi_left_x + int(gx)
+            gy_global = roi_top_y + int(gy)
+            top_centroid = (gx_global, gy_global)
+    except Exception:
+        top_centroid = None
 
-    # base union of body and top
-    x_full  = min(x, gx_global)
-    y_full  = min(y, gy_global)
-    x_full2 = max(x + w, gx_global + gw)
-    y_full2 = max(y + h, gy_global + gh)
-    w_full  = x_full2 - x_full
-    h_full  = y_full2 - y_full
+    if top_centroid is None:
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) > 0:
+            top_cnt = max(contours, key=cv2.contourArea)
+            tx, ty, tw, th = cv2.boundingRect(top_cnt)
+            gx_global = roi_left_x + tx + tw // 2
+            gy_global = roi_top_y + ty + th // 2
+            top_centroid = (gx_global, gy_global)
 
-    # ---------- EXTEND BBOX TO COVER FULL FRUIT ----------
-    # extend a bit above the union and more below it
-    margin_top = int(0.5 * h_full)     # 20% extra above
-    margin_bot = int(0.2 * h_full)     # 40% extra below
+    if top_centroid is None:
+        cx_top = x + w // 2
+        cy_top = y
+        return x, y, w, h, cx_top, cy_top
 
-    new_y = max(0, y_full - margin_top)
-    new_bottom = min(img_h, y_full + h_full + margin_bot)
-    new_h = new_bottom - new_y
+    gx, gy = top_centroid
+    g_w = int(0.6 * w) if w > 0 else 20
+    g_h = int(0.5 * h) if h > 0 else 12
+    gx0 = max(0, gx - g_w // 2)
+    gy0 = max(0, gy - g_h // 2)
 
-    y_full = new_y
-    h_full = new_h
+    x_full = min(x, gx0)
+    y_full = min(y, gy0)
+    x_full2 = max(x + w, gx0 + g_w)
+    y_full2 = max(y + h, gy0 + g_h)
+    w_full = x_full2 - x_full
+    h_full = y_full2 - y_full
 
-    # centroid of green top (used for TF & green dot)
-    cx_top = gx_global + gw // 2
-    cy_top = gy_global + gh // 2
+    pad_x = int(0.08 * w_full) + 2
+    pad_y = int(0.08 * h_full) + 2
+    x_full = max(0, x_full - pad_x)
+    y_full = max(0, y_full - pad_y)
+    w_full = min(img_w - x_full, w_full + 2 * pad_x)
+    h_full = min(img_h - y_full, h_full + 2 * pad_y)
+
+    cx_top = gx
+    cy_top = gy
 
     return x_full, y_full, w_full, h_full, cx_top, cy_top
-
 
 
 # ----------------------------- MAIN CLASS ----------------------------------
@@ -249,12 +371,14 @@ class aruco_tf(Node):
             self.depth_image = self.bridge.imgmsg_to_cv2(data, desired_encoding='passthrough')
         except Exception as e:
             self.get_logger().error(f"Depth image conversion failed: {str(e)}")
+            self.depth_image = None
 
     def colorimagecb(self, data):
         try:
             self.cv_image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
         except Exception as e:
             self.get_logger().error(f"Color image conversion failed: {str(e)}")
+            self.cv_image = None
 
     def process_image(self):
         if self.cv_image is None:
@@ -335,11 +459,11 @@ class aruco_tf(Node):
             self.br.sendTransform(t_bad)
 
             # draw full fruit bbox and top-centre dot
-            cv2.rectangle(img, (x_full, y_full),
-                          (x_full + w_full, y_full + h_full),
+            cv2.rectangle(img, (int(x_full), int(y_full)),
+                          (int(x_full + w_full), int(y_full + h_full)),
                           (0, 255, 0), 2)
-            cv2.circle(img, (cx_top, cy_top), 6, (0, 255, 0), -1)
-            cv2.putText(img, f"bad_fruit_{bad_fruit_id}", (x_full, y_full - 10),
+            cv2.circle(img, (int(cx_top), int(cy_top)), 6, (0, 255, 0), -1)
+            cv2.putText(img, f"bad_fruit_{bad_fruit_id}", (int(x_full), int(y_full) - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
             bad_fruit_id += 1
