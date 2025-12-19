@@ -3,34 +3,27 @@
 Team ID:          3577
 Theme:            Krishi coBot
 Author List:      D Anudeep, Karthik, Vishwa, Manikanta
-Filename:         task3b_ur5_servo_pick_place.py
-Purpose:
---------
-UR5 servo-based integrated pick & place for Task 3B.
-
-Behavior (same as Task2B):
+Filename:         task3b_manipulation.py
+Purpose:          UR5 servo-based integrated pick & place using Task1C servo loop +
+                  Task2B pick/place actions for fertiliser and bad fruits.
+Behavior:
   - Sequence: Initial -> P1 -> Initial -> anticlockwise offset -> P2 -> P3
   - P1: pick fertiliser (aruco_3) -> place on eBot top (aruco_6)
   - P2: pick bad fruits (3577_bad_fruit_1/2/3) one-by-one -> drop at P3
   - Stops at P3
-
-New for Task 3B:
-  - Subscribes to /detection_status and only starts motion AFTER
-    receiving a DOCK_STATION,x,y,0 message (eBot docked).
 '''
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from tf2_ros import Buffer, TransformListener
-from std_msgs.msg import String
-
 import numpy as np
 import math
 import time
 from threading import Thread
 from linkattacher_msgs.srv import AttachLink, DetachLink
 from scipy.spatial.transform import Rotation as R
+from std_msgs.msg import String
 
 
 # ---------------- Waypoints ----------------
@@ -41,37 +34,49 @@ WAYPOINTS = [
 ]
 
 # ---------------- Object Frames ----------------
-FERTILISER_FRAME = 'aruco_3'
-EBOT_TOP_FRAME = 'aruco_6'
-BAD_FRUIT_FRAMES = ['3577_bad_fruit_1', '3577_bad_fruit_2', '3577_bad_fruit_3']
+FERTILISER_FRAME = '3577_fertilizer_1'
+EBOT_TOP_FRAME = '3577_fertiliser_drop'
+BAD_FRUIT_FRAMES = ['3577_bad_fruit_3', '3577_bad_fruit_2', '3577_bad_fruit_1']
 
 # ---------------- Models ----------------
 FERTILISER_MODEL = 'fertiliser_can'
 BAD_FRUIT_MODEL = 'bad_fruit'
 
 # ---------------- Motion Parameters ----------------
-PRE_Z_OFFSET = 0.01             # approach above object
-GRASP_Z_OFFSET = -0.02          # go slightly down to grasp
-LIFT_Z_AFTER_ATTACH = 0.09      # lift a bit
-LIFT_ZZ_AFTER_ATTACH = 0.25     # lift after placing
-ATTACH_DISTANCE_THRESH = 0.10   # distance to trigger attach
+PRE_Z_OFFSET = 0.01            # Approach 5 cm above object
+GRASP_Z_OFFSET = -0.06         # Go 2 cm below pre-pose for pickup
+LIFT_Z_AFTER_ATTACH = 0.18    # Lift object higher (25 cm) to avoid collision
+LIFT_ZZ_AFTER_ATTACH = 0.15  
+ATTACH_DISTANCE_THRESH = 0.10  # Distance to trigger attach
+TRASH_DROP_OFFSET = -0.0  
+TRASH_CLEARANCE_Z = 0.20
+
 
 
 class UR5ServoPickPlace(Node):
     def __init__(self):
-        super().__init__('ur5_servo_pick_place_3b')
+        super().__init__('ur5_servo_pick_place')
 
         self.pub = self.create_publisher(Twist, '/delta_twist_cmds', 10)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # attach/detach services
+        # attach/detach service clients
         self.attach_client = self.create_client(AttachLink, '/attach_link')
         self.detach_client = self.create_client(DetachLink, '/detach_link')
-
-        # subscribe to detection_status for DOCK_STATION sync
-        self.status_sub = self.create_subscription(
-            String, '/detection_status', self.status_cb, 10)
+         # >>> SYNC ADD <<<
+        self.dock_reached = False
+        self.create_subscription(
+            String,
+            '/detection_status',
+            self.dock_status_cb,
+            10
+        )
+        self.detach_status_pub = self.create_publisher(
+            String,
+            '/fertilizer_detach_status',
+            10
+        )
 
         # servo control params
         self.rate_hz = 30.0
@@ -80,8 +85,8 @@ class UR5ServoPickPlace(Node):
         self.kp_ang = 0.6
         self.max_lin = 0.25
         self.max_ang = 0.5
-        self.tolerance_pos = 0.10
-        self.tolerance_ori = 0.12
+        self.tolerance_pos = 0.20
+        self.tolerance_ori = 0.20
 
         self.base_frame = 'base_link'
         self.ee_frame = 'wrist_3_link'
@@ -95,22 +100,13 @@ class UR5ServoPickPlace(Node):
         self.wait_timer = None
         self.active = False
 
-        # will be set True after DOCK_STATION arrives
-        self.ready_to_start = True
-
         self.create_timer(self.dt, self.update_loop)
-        self.get_logger().info('✅ UR5 servo pick-place (Task3B) initialised. Waiting for DOCK_STATION...')
-
-    # ---------- detection_status callback ----------
-    def status_cb(self, msg: String):
-        parts = msg.data.split(',')
-        if len(parts) < 1:
-            return
-        if parts[0] == "DOCK_STATION":
-            if not self.ready_to_start:
-                self.ready_to_start = True
-                self.get_logger().info('🚢 DOCK_STATION received – starting UR5 sequence.')
-
+        self.get_logger().info('✅ UR5 servo pick-place node initialised. Waiting for initial pose capture.')
+     # >>> SYNC ADD <<<
+    def dock_status_cb(self, msg):
+        if msg.data.startswith("DOCK_STATION"):
+            self.get_logger().info("📍 Dock station reached → UR5 unlocked")
+            self.dock_reached = True
     # ---------- Quaternion helpers ----------
     def normalize_quat(self, q):
         q = np.array(q, dtype=float)
@@ -141,9 +137,8 @@ class UR5ServoPickPlace(Node):
     # ---------- TF Helpers ----------
     def get_current_pose(self):
         try:
-            trans = self.tf_buffer.lookup_transform(
-                self.base_frame, self.ee_frame,
-                rclpy.time.Time(), rclpy.duration.Duration(seconds=1))
+            trans = self.tf_buffer.lookup_transform(self.base_frame, self.ee_frame,
+                                                    rclpy.time.Time(), rclpy.duration.Duration(seconds=1))
             pos = np.array([trans.transform.translation.x,
                             trans.transform.translation.y,
                             trans.transform.translation.z], dtype=float)
@@ -157,9 +152,8 @@ class UR5ServoPickPlace(Node):
 
     def get_tf_pose(self, frame_name):
         try:
-            trans = self.tf_buffer.lookup_transform(
-                self.base_frame, frame_name,
-                rclpy.time.Time(), rclpy.duration.Duration(seconds=2))
+            trans = self.tf_buffer.lookup_transform(self.base_frame, frame_name,
+                                                    rclpy.time.Time(), rclpy.duration.Duration(seconds=2))
             pos = np.array([trans.transform.translation.x,
                             trans.transform.translation.y,
                             trans.transform.translation.z], dtype=float)
@@ -167,10 +161,8 @@ class UR5ServoPickPlace(Node):
                              trans.transform.rotation.y,
                              trans.transform.rotation.z,
                              trans.transform.rotation.w], dtype=float)
-            if 'aruco' in frame_name or 'bad_fruit' in frame_name:
-                pos[2] += 0.015
-                quat = R.from_euler('xyz', [math.pi, 0, 0]).as_quat()
-            return pos, self.normalize_quat(quat)
+            quat = self.normalize_quat(quat)
+            return pos, quat
         except Exception as e:
             self.get_logger().warn(f'get_tf_pose: failed for {frame_name}: {e}')
             return None, None
@@ -200,8 +192,7 @@ class UR5ServoPickPlace(Node):
         seq.append(WAYPOINTS[0])
         seq.append(init)
         anticlockwise_offset = np.array(init['position']) + np.array([0.0, 0.25, 0.0])
-        anticlockwise_pose = {'position': anticlockwise_offset.tolist(),
-                              'orientation': init['orientation']}
+        anticlockwise_pose = {'position': anticlockwise_offset.tolist(), 'orientation': init['orientation']}
         seq.append(anticlockwise_pose)
         seq.append(WAYPOINTS[1])
         seq.append(WAYPOINTS[2])
@@ -209,7 +200,7 @@ class UR5ServoPickPlace(Node):
 
     # ---------- Attach / Detach ----------
     def attach_model(self, model1_name):
-        if not self.attach_client.wait_for_service(timeout_sec=3.0):
+        if not self.attach_client.wait_for_service(timeout_sec=6.0):
             self.get_logger().error('attach service unavailable')
             return False
         req = AttachLink.Request()
@@ -222,7 +213,7 @@ class UR5ServoPickPlace(Node):
         return True
 
     def detach_model(self, model1_name):
-        if not self.detach_client.wait_for_service(timeout_sec=3.0):
+        if not self.detach_client.wait_for_service(timeout_sec=6.0):
             self.get_logger().error('detach service unavailable')
             return False
         req = DetachLink.Request()
@@ -235,7 +226,7 @@ class UR5ServoPickPlace(Node):
         return True
 
     # ---------- Pick / Place ----------
-    def move_and_wait(self, target_pos, target_quat, timeout=10.0):
+    def move_and_wait(self, target_pos, target_quat, timeout=15.0):
         target_pos = np.array(target_pos)
         target_quat = self.normalize_quat(target_quat)
         start = time.time()
@@ -261,12 +252,15 @@ class UR5ServoPickPlace(Node):
         if pos is None:
             return False
 
+        # 1️⃣ Approach above
         pre = pos + np.array([0, 0, PRE_Z_OFFSET])
         self.move_and_wait(pre, quat)
 
+        # 2️⃣ Lower to grasp
         grasp = pos + np.array([0, 0, GRASP_Z_OFFSET])
         self.move_and_wait(grasp, quat)
 
+        # 3️⃣ Check distance before attaching
         cpos, _ = self.get_current_pose()
         dist = np.linalg.norm(cpos - pos)
         self.get_logger().info(f'Distance before attach: {dist:.3f} m')
@@ -285,6 +279,7 @@ class UR5ServoPickPlace(Node):
             self.get_logger().error('Still too far to attach!')
             return False
 
+        # 4️⃣ Lift up higher to avoid collision
         lifted = pos + np.array([0, 0, LIFT_Z_AFTER_ATTACH])
         self.move_and_wait(lifted, quat)
         self.get_logger().info(f"✅ Picked and safely lifted {model_name}")
@@ -294,20 +289,46 @@ class UR5ServoPickPlace(Node):
         pos = np.array(pos)
         quat = self.normalize_quat(np.array(quat))
 
+        # 1️⃣ Approach from above
         pre = pos + np.array([0, 0, PRE_Z_OFFSET])
         self.move_and_wait(pre, quat)
 
-        lower = pos + np.array([0, 0, GRASP_Z_OFFSET])
+        # 2️⃣ Lower gently
+        lower = pos + np.array([0, 0, 0])
         self.move_and_wait(lower, quat)
 
+        # 3️⃣ Detach
         self.detach_model(model_name)
         time.sleep(0.3)
 
+        # 4️⃣ Lift back high to clear area
         lifted = pos + np.array([0, 0, LIFT_ZZ_AFTER_ATTACH])
         self.move_and_wait(lifted, quat)
         self.get_logger().info(f"🧲 Detached and lifted after placing {model_name}")
         return True
+    
+    def plac_and_detach(self, pos, quat, model_name):
+        pos = np.array(pos)
+        quat = self.normalize_quat(np.array(quat))
 
+            # 1️⃣ Move HIGH above trash bin (avoid tray edge)
+        high_above = pos + np.array([0, 0, TRASH_CLEARANCE_Z])
+        self.move_and_wait(high_above, quat)
+
+            # 2️⃣ Move DOWN vertically into bin
+        drop_pose = pos + np.array([0, 0, TRASH_DROP_OFFSET])
+        self.move_and_wait(drop_pose, quat)
+
+            # 3️⃣ Detach object
+        self.detach_model(model_name)
+        time.sleep(0.3)
+
+            # 4️⃣ Lift straight UP to clear tray
+        lift_after = pos + np.array([0, 0, TRASH_CLEARANCE_Z])
+        self.move_and_wait(lift_after, quat)
+
+        self.get_logger().info(f"🗑️ Safely placed {model_name} into trash bin")
+        return True
     # ---------- Task Actions ----------
     def perform_action_for_target(self, idx):
         try:
@@ -317,6 +338,10 @@ class UR5ServoPickPlace(Node):
                     ebot_pos, ebot_quat = self.get_tf_pose(EBOT_TOP_FRAME)
                     if ebot_pos is not None:
                         self.place_and_detach(ebot_pos, ebot_quat, FERTILISER_MODEL)
+                        # >>> SYNC ADD <<<
+                        msg = String()
+                        msg.data = "fertilizer_detached"
+                        self.detach_status_pub.publish(msg)
 
             elif idx == 4:
                 self.get_logger().info('[ACTION] At P2: picking bad fruits')
@@ -324,29 +349,24 @@ class UR5ServoPickPlace(Node):
                 trash_quat = WAYPOINTS[2]['orientation']
                 for fruit in BAD_FRUIT_FRAMES:
                     if self.pick_and_attach(fruit, BAD_FRUIT_MODEL):
-                        self.place_and_detach(trash_pos, trash_quat, BAD_FRUIT_MODEL)
+                        self.move_and_wait(WAYPOINTS[1]['position'], WAYPOINTS[1]['orientation'])
+                        self.plac_and_detach(trash_pos, trash_quat, BAD_FRUIT_MODEL)
                         self.move_and_wait(WAYPOINTS[1]['position'], WAYPOINTS[1]['orientation'])
         finally:
             self.advance_target()
 
     # ---------- Servo Loop ----------
     def update_loop(self):
+        if not self.dock_reached:   # >>> SYNC ADD <<<
+            return
         if (time.time() - self.start_time) < self.tf_delay:
             return
-
-        # wait until eBot docked
-        if not self.ready_to_start:
-            return
-
         curr_pos, curr_quat = self.get_current_pose()
         if curr_pos is None:
             return
 
         if not self.active and self.initial_pose is None:
-            self.initial_pose = {
-                'position': curr_pos.tolist(),
-                'orientation': curr_quat.tolist()
-            }
+            self.initial_pose = {'position': curr_pos.tolist(), 'orientation': curr_quat.tolist()}
             self.get_logger().info(f'Initial pose captured: {self.initial_pose}')
             self.sequence = self.create_motion_sequence()
             self.active = True
@@ -366,8 +386,7 @@ class UR5ServoPickPlace(Node):
         if pos_dist < self.tolerance_pos and ori_dist < self.tolerance_ori:
             self.pub.publish(Twist())
             self.waiting = True
-            self.wait_timer = self.create_timer(
-                0.8, lambda: self._timer_action_wrapper(self.current_target_index))
+            self.wait_timer = self.create_timer(1.0, lambda: self._timer_action_wrapper(self.current_target_index))
             return
 
         self.publish_twist_for_error(pos_err, ori_err)
@@ -386,8 +405,8 @@ class UR5ServoPickPlace(Node):
             self.get_logger().info('✅ All waypoints and tasks completed. Stopping at P3.')
             self.active = False
         else:
-            self.get_logger().info(
-                f'Moving to next target {self.current_target_index+1}/{len(self.sequence)}')
+            self.get_logger().info(f'Moving to next target {self.current_target_index+1}/{len(self.sequence)}')
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -404,4 +423,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-

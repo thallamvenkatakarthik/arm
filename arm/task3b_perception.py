@@ -4,7 +4,7 @@
 Team ID:          3577
 Theme:            KRISHI COBOT
 Author List:      Anudeep, Karthik, Vishwa, Manikanta
-Filename:         task3b.py
+Filename:         task2b.py
 Purpose:          Detect ArUco and bad fruits, publish TFs. Special orientation
                   correction applied for aruco_3 so UR5 will approach from the side.
 '''
@@ -118,7 +118,7 @@ def detect_bad_fruits(image):
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
         if x >= tray_x1 and y >= tray_y1 and (x + w) <= tray_x2 and (y + h) <= tray_y2:
-            if cv2.contourArea(cnt) > 200:
+            if cv2.contourArea(cnt) > 100:
                 filtered.append(cnt)
     return filtered
 
@@ -162,10 +162,10 @@ class aruco_tf(Node):
         # Offsets (tune these to your Gazebo camera mount)
         CAMERA_OFFSET_X = -0.18
         CAMERA_OFFSET_Y = -0.01999
-        CAMERA_OFFSET_Z = 1.592
+        CAMERA_OFFSET_Z = 1.572
         # secondary camera/base offsets used for ArUco pose -> base_link conversion
         CAMERAA_OFFSET_X = -1.118
-        CAMERAA_OFFSET_Y = -0.03
+        CAMERAA_OFFSET_Y = 0.0085
         CAMERAA_OFFSET_Z = 0.25
 
         img = self.cv_image.copy()
@@ -245,8 +245,8 @@ class aruco_tf(Node):
                 # marker-specific small tweaks (keep if you calibrated earlier)
                 if marker_id == 6:
                     base_z += -0.87
-                    base_y += -0.0
-                    base_x += -0.06
+                    base_y += 0.02
+                    base_x += 0.03
 
                 # Build a robust orientation quaternion for the marker frame
                 try:
@@ -351,4 +351,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

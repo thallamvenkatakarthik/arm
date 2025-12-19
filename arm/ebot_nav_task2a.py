@@ -37,6 +37,8 @@ class EbotSpecMission(Node):
         self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_cb, 20)
         self.pub = self.create_publisher(String, '/detection_status', 10)
         self.status_sub = self.create_subscription(String, '/detection_status', self.status_cb, 10)
+        self.fertilizer_detached = True
+        self.detach_sub = self.create_subscription(String,'/fertilizer_detach_status',self.detach_cb,10)
 
         self.global_pause = False
         self.global_pause_start = None
@@ -52,8 +54,8 @@ class EbotSpecMission(Node):
         self.state = 'INIT_ROTATE'
         self.target_yaw = None
 
-        self.linear_speed = 0.7
-        self.angular_speed = 0.45
+        self.linear_speed = 2.0
+        self.angular_speed = 1.0
         self.obstacle_threshold = 0.72
         self.emergency_stop = 0.5
         self.dist_tolerance = 0.15
@@ -70,7 +72,7 @@ class EbotSpecMission(Node):
         # self.pause_timer = None
         self.pause_start_time = None
         self.pause_duration = 2.0  # seconds
-
+        self.fertilizer_pause_duration = 7.0
         self.create_timer(0.1, self._timer_cb)
         self.get_logger().info("✅ eBot Spec Mission initialized (with axis alignment navigation to P2).")
 
@@ -78,6 +80,11 @@ class EbotSpecMission(Node):
     def _timer_cb(self):
         if self.state == 'STOP':
             self.cmd_pub.publish(Twist())
+
+    def detach_cb(self, msg):
+        if msg.data.strip() == "fertilizer_detached":
+            self.fertilizer_detached = True
+            self.get_logger().info("🧲 Fertilizer detachment received — bot will resume when 2 sec is complete.")
 
     # ---------------- ODOM ----------------
     def odom_cb(self, msg):
@@ -111,7 +118,7 @@ class EbotSpecMission(Node):
 
             # Publish coordinates immediately
             coord_msg = String()
-            coord_msg.data = f"GLOBAL_PAUSE,{x:.2f},{y:.2f}"
+            coord_msg.data = f"GLOBAL_PAUSE,{x:.2f},{y:.2f},0"
             # self.pub.publish(coord_msg)
             self.get_logger().info(f"📡 Published global pause coordinates: {coord_msg.data}")
 
@@ -159,8 +166,8 @@ class EbotSpecMission(Node):
             if self.front < self.emergency_stop:
                 self.state = 'CORRECT_LEFT_60'
             elif self.front < self.obstacle_threshold:
-                self.state = 'CORRECT_LEFT_60'
-                self.get_logger().info("🧱 Obstacle detected. Rotating 60° left...")
+                 self.state = 'CORRECT_LEFT_60'
+                 self.get_logger().info("🧱 Obstacle detected. Rotating 60° left...")
             else:
                 cmd.linear.x = self.linear_speed
 
@@ -220,8 +227,9 @@ class EbotSpecMission(Node):
             elapsed = (current_time - self.pause_start_time).nanoseconds / 1e9
 
             # After 2 seconds, continue mission
-            if elapsed >= self.pause_duration:
+            if elapsed >= self.fertilizer_pause_duration and self.fertilizer_detached:
                 self.state = 'AFTER_P1_MOVE_UNTIL_OBSTACLE'
+                self.fertilizer_detached = False 
                 if hasattr(self, 'p1_detection_published'):
                     del self.p1_detection_published  # clean up flag
                 self.get_logger().info(f"✅ Pause complete ({self.pause_duration}s). Continuing mission.")
