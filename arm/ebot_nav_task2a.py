@@ -48,6 +48,8 @@ class EbotSpecMission(Node):
         self.P3 = (-1.53, -5.55, 1.57)
         self.P1 = (0.26, -1.95, 1.57)
         self.P2 = (-1.48, -0.67, -1.57)
+        self.P_INT = (0.13, 1.5, 1.57)
+
 
         self.pose = None
         self.front = 10.0
@@ -228,7 +230,7 @@ class EbotSpecMission(Node):
 
             # After 2 seconds, continue mission
             if elapsed >= self.fertilizer_pause_duration and self.fertilizer_detached:
-                self.state = 'AFTER_P1_MOVE_UNTIL_OBSTACLE'
+                self.state = 'MOVE_TO_INTERMEDIATE'
                 self.fertilizer_detached = False 
                 if hasattr(self, 'p1_detection_published'):
                     del self.p1_detection_published  # clean up flag
@@ -242,6 +244,30 @@ class EbotSpecMission(Node):
                 self.get_logger().info("🧱 Obstacle detected after P1. Turning 90° left...")
             else:
                 cmd.linear.x = self.linear_speed
+
+
+        # 5️⃣ Move to INTERMEDIATE POINT (replaces move-until-obstacle logic)
+        elif self.state == 'MOVE_TO_INTERMEDIATE':
+            gx, gy, _ = self.P_INT
+            dx, dy = gx - x, gy - y
+            dist = math.hypot(dx, dy)
+
+            goal_yaw = math.atan2(dy, dx)
+            yaw_err = self._normalize(goal_yaw - yaw)
+
+            # Rotate toward intermediate point
+            if abs(yaw_err) > self.yaw_tolerance:
+                cmd.angular.z = math.copysign(self.angular_speed, yaw_err)
+            else:
+                cmd.linear.x = self.linear_speed
+
+            # Arrival check
+            if dist < self.dist_tolerance:
+                cmd = Twist()
+                self.cmd_pub.publish(cmd)
+                self.state = 'TURN_LEFT_90'
+                self.get_logger().info("✅ Reached intermediate point. Proceeding with 90° left turn.")
+
 
         # 6️⃣ Rotate +90° left
         elif self.state == 'TURN_LEFT_90':
